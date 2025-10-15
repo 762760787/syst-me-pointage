@@ -53,7 +53,10 @@ Route::middleware(['auth'])->prefix('admin')->name('admin.')->group(function () 
     // Affiche les feuilles de présence
     Route::get('/attendances', [AppController::class, 'attendances'])->name('attendances.index');
 
-    Route::get('/historiquePointage', [AppController::class, 'history'])->name('historique');
+    Route::get('/historiquePointage', [AppController::class, 'history'])->name('history.index');
+
+    Route::get('/admin/history/export', [AppController::class, 'exportHistory'])->name('history.export');
+
 });
 
 

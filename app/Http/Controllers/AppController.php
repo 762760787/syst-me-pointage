@@ -10,6 +10,9 @@ use Illuminate\Support\Str;
 use Exception;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
+use Barryvdh\DomPDF\Facade\Pdf;
+use Maatwebsite\Excel\Facades\Excel;
+use App\Exports\AttendanceHistoryExport;
 
 class AppController extends Controller
 {
@@ -20,15 +23,246 @@ class AppController extends Controller
 
 
     /**
-     * Affiche l'historique des pointages par semaine.
+     * Affiche l'historique des pointages par journée (nouvelle version professionnelle).
      */
-    public function history()
+    public function history(Request $request)
+    {
+        // Récupère le nom de l'employé depuis la requête du filtre
+        $employeeName = $request->input('employee_name');
+
+        // Récupère tous les employés pour peupler le menu déroulant du filtre
+        $employees = Employee::orderBy('prenom')->get();
+
+        // Commence la requête pour les pointages en incluant les informations de l'employé
+        $attendanceQuery = Attendance::with('employee')->orderBy('timestamp', 'desc');
+
+        // Si un nom d'employé est sélectionné dans le filtre, on l'ajoute à la requête
+        if ($employeeName) {
+            $attendanceQuery->whereHas('employee', function ($query) use ($employeeName) {
+                $query->where('prenom', $employeeName);
+            });
+        }
+
+        // Exécute la requête
+        $attendances = $attendanceQuery->get();
+
+        // Groupe tous les pointages par jour
+        $attendancesByDay = $attendances->groupBy(function ($attendance) {
+            return Carbon::parse($attendance->timestamp)->format('Y-m-d');
+        });
+
+        $history = [];
+
+        // Boucle sur chaque journée pour traiter les données
+        foreach ($attendancesByDay as $date => $dayAttendances) {
+            $dayLabel = Carbon::parse($date)->translatedFormat('l j F Y');
+            $records = [];
+
+            // Regroupe les pointages de la journée par employé
+            $attendancesByEmployee = $dayAttendances->groupBy('employee_id');
+
+            foreach ($attendancesByEmployee as $employeeId => $employeeAttendances) {
+                $employee = $employeeAttendances->first()->employee;
+                $arrival = $employeeAttendances->where('type', 'Arrivée')->sortBy('timestamp')->first();
+                $departure = $employeeAttendances->where('type', 'Sortie')->sortByDesc('timestamp')->first();
+
+                $arrivalTime = $arrival ? Carbon::parse($arrival->timestamp) : null;
+                $departureTime = $departure ? Carbon::parse($departure->timestamp) : null;
+
+                $workedDuration = '0h 00m';
+                $observation = 'OK';
+
+                if (!$arrivalTime) {
+                    $observation = 'Arrivée manquante';
+                } elseif (!$departureTime) {
+                    $observation = 'Départ manquant';
+                }
+
+                // Calcule le temps de travail si arrivée et départ existent
+                if ($arrivalTime && $departureTime) {
+                    $breakStart = Carbon::parse($date . ' 13:30:00');
+                    $breakEnd = Carbon::parse($date . ' 14:30:00');
+
+                    $overlapStart = $arrivalTime->max($breakStart);
+                    $overlapEnd = $departureTime->min($breakEnd);
+
+                    $overlapSeconds = 0;
+                    if ($overlapStart < $overlapEnd) {
+                        $overlapSeconds = $overlapStart->diffInSeconds($overlapEnd);
+                    }
+
+                    $totalSecondsOnSite = $arrivalTime->diffInSeconds($departureTime);
+                    $workedSeconds = $totalSecondsOnSite - $overlapSeconds;
+
+                    if ($workedSeconds < 0) $workedSeconds = 0;
+
+                    $hours = floor($workedSeconds / 3600);
+                    $minutes = floor(($workedSeconds % 3600) / 60);
+                    $workedDuration = sprintf('%dh %02dm', $hours, $minutes);
+
+                    if ($workedSeconds < (7 * 3600)) {
+                        $observation = 'Heures incomplètes';
+                    }
+                }
+
+                $records[] = [
+                    'employee' => $employee,
+                    'arrival' => $arrivalTime ? $arrivalTime->format('H:i') : '---',
+                    'departure' => $departureTime ? $departureTime->format('H:i') : '---',
+                    'break' => '13:30 - 14:30',
+                    'worked_duration' => $workedDuration,
+                    'observation' => $observation
+                ];
+            }
+
+            $history[$date] = [
+                'day_label' => $dayLabel,
+                'attendances' => $records
+            ];
+        }
+
+        // Retourne la vue avec les données de l'historique, la liste des employés et l'employé sélectionné
+        return view('admin.history.index', [
+            'history' => $history,
+            'employees' => $employees,
+            'selected_employee' => $employeeName
+        ]);
+    }
+
+    /**
+     * Gère l'export de l'historique en PDF ou Excel.
+     */
+    public function exportHistory(Request $request)
+    {
+        $validated = $request->validate([
+            'period' => 'required|in:current_month,last_month,current_week,last_week',
+            'format' => 'required|in:excel,pdf',
+        ]);
+
+        $period = $validated['period'];
+        $format = $validated['format'];
+        $periodName = '';
+
+        switch ($period) {
+            case 'last_month':
+                $startDate = Carbon::now()->subMonth()->startOfMonth();
+                $endDate = Carbon::now()->subMonth()->endOfMonth();
+                $periodName = 'Mois Dernier (' . $startDate->translatedFormat('F Y') . ')';
+                break;
+            case 'current_week':
+                $startDate = Carbon::now()->startOfWeek();
+                $endDate = Carbon::now()->endOfWeek();
+                $periodName = 'Semaine en Cours';
+                break;
+            case 'last_week':
+                $startDate = Carbon::now()->subWeek()->startOfWeek();
+                $endDate = Carbon::now()->subWeek()->endOfWeek();
+                $periodName = 'Semaine Dernière';
+                break;
+            case 'current_month':
+            default:
+                $startDate = Carbon::now()->startOfMonth();
+                $endDate = Carbon::now()->endOfMonth();
+                $periodName = 'Mois en Cours (' . $startDate->translatedFormat('F Y') . ')';
+                break;
+        }
+
+        $dateRange = 'Du ' . $startDate->format('d/m/Y') . ' au ' . $endDate->format('d/m/Y');
+        $fileName = "historique_pointages_{$period}_" . Carbon::now()->format('Y-m-d');
+
+        if ($format == 'excel') {
+            return Excel::download(new AttendanceHistoryExport($startDate, $endDate), "{$fileName}.xlsx");
+        }
+
+        if ($format == 'pdf') {
+            // --- DÉBUT DE LA CORRECTION ---
+            // On ne réutilise PAS l'export Excel. On reconstruit les données
+            // avec la structure attendue par le template PDF (groupée par jour),
+            // en s'inspirant de la logique de la méthode history().
+
+            $attendances = Attendance::with('employee')
+                ->whereBetween('timestamp', [$startDate, $endDate])
+                ->orderBy('timestamp', 'asc') // Tri par ordre chronologique pour faciliter le traitement
+                ->get();
+
+            $attendancesByDay = $attendances->groupBy(fn($attendance) => Carbon::parse($attendance->timestamp)->format('Y-m-d'));
+
+            $historyData = collect(); // Utiliser une collection est une bonne pratique
+            foreach ($attendancesByDay as $date => $dayAttendances) {
+                $dayLabel = Carbon::parse($date)->translatedFormat('l j F Y');
+                $records = [];
+                $attendancesByEmployee = $dayAttendances->groupBy('employee_id');
+
+                foreach ($attendancesByEmployee as $employeeId => $employeeAttendances) {
+                    $employee = $employeeAttendances->first()->employee;
+                    $arrival = $employeeAttendances->where('type', 'Arrivée')->first();
+                    $departure = $employeeAttendances->where('type', 'Sortie')->last();
+
+                    $arrivalTime = $arrival ? Carbon::parse($arrival->timestamp) : null;
+                    $departureTime = $departure ? Carbon::parse($departure->timestamp) : null;
+                    $workedDuration = '0h 00m';
+                    $observation = 'OK';
+
+                    if (!$arrivalTime) $observation = 'Arrivée manquante';
+                    elseif (!$departureTime) $observation = 'Départ manquant';
+
+                    if ($arrivalTime && $departureTime) {
+                        $breakStart = Carbon::parse($date . ' 13:30:00');
+                        $breakEnd = Carbon::parse($date . ' 14:30:00');
+                        $overlapStart = $arrivalTime->max($breakStart);
+                        $overlapEnd = $departureTime->min($breakEnd);
+                        $overlapSeconds = ($overlapStart < $overlapEnd) ? $overlapStart->diffInSeconds($overlapEnd) : 0;
+                        $totalSecondsOnSite = $arrivalTime->diffInSeconds($departureTime);
+                        $workedSeconds = max(0, $totalSecondsOnSite - $overlapSeconds);
+
+                        $hours = floor($workedSeconds / 3600);
+                        $minutes = floor(($workedSeconds % 3600) / 60);
+                        $workedDuration = sprintf('%dh %02dm', $hours, $minutes);
+
+                        if ($workedSeconds < (7 * 3600)) $observation = 'Heures incomplètes';
+                    }
+
+                    $records[] = [
+                        'employee' => $employee,
+                        'arrival' => $arrivalTime ? $arrivalTime->format('H:i') : '---',
+                        'departure' => $departureTime ? $departureTime->format('H:i') : '---',
+                        'worked_duration' => $workedDuration,
+                        'observation' => $observation
+                    ];
+                }
+
+                $historyData->push([
+                    'day_label' => $dayLabel,
+                    'attendances' => $records
+                ]);
+            }
+
+            $pdf = Pdf::loadView('admin.history.export_template', [
+                'data' => $historyData, // On passe les données correctement formatées
+                'periodName' => $periodName,
+                'dateRange' => $dateRange
+            ]);
+            // --- FIN DE LA CORRECTION ---
+
+            return $pdf->download("{$fileName}.pdf");
+        }
+
+        return redirect()->route('admin.history.index')->with('error', 'Format d\'exportation non valide.');
+    }
+    /**
+     * Fonction privée pour récupérer et formater les données d'historique pour une période donnée.
+     * @param Carbon $startDate
+     * @param Carbon $endDate
+     * @return array
+     */
+    private function getHistoryData(Carbon $startDate, Carbon $endDate): array
     {
         // Temps de travail requis en secondes (excluant la pause d'1h)
         $requiredWorkSeconds = 7 * 3600;
 
-        // Récupérer tous les pointages, triés par date
+        // Récupérer les pointages dans la période donnée
         $attendances = Attendance::with('employee')
+            ->whereBetween('timestamp', [$startDate, $endDate])
             ->orderBy('timestamp', 'asc')
             ->get();
 
@@ -46,22 +280,15 @@ class AppController extends Controller
             $dayCarbon = Carbon::parse($date);
             $dayLabel = $dayCarbon->translatedFormat('l j F Y');
 
-            // Grouper les pointages de la journée par employé
             $attendancesByEmployee = $dayAttendances->groupBy('employee_id');
-
             $dailyRecords = [];
 
             foreach ($attendancesByEmployee as $employeeId => $employeeAttendances) {
-                if ($employeeAttendances->isEmpty() || !$employeeAttendances->first()->employee) {
-                    continue;
-                }
+                if ($employeeAttendances->isEmpty() || !$employeeAttendances->first()->employee) continue;
 
                 $employee = $employeeAttendances->first()->employee;
-
-                // Trouver le premier pointage d'arrivée et le dernier de sortie
                 $arrivalRecord = $employeeAttendances->where('type', 'Arrivée')->first();
                 $departureRecord = $employeeAttendances->where('type', 'Sortie')->last();
-
                 $arrival = $arrivalRecord ? Carbon::parse($arrivalRecord->timestamp) : null;
                 $departure = $departureRecord ? Carbon::parse($departureRecord->timestamp) : null;
 
@@ -69,44 +296,27 @@ class AppController extends Controller
                 $workedDurationFormatted = '---';
 
                 if ($arrival && $departure) {
-
-                    // --- LOGIQUE DE CALCUL CORRIGÉE ET FIABILISÉE ---
-                    // 1. Calculer le temps total passé sur site
                     $totalSecondsOnSite = $departure->diffInSeconds($arrival);
-
-                    // 2. Définir la période de pause fixe pour la journée en cours
                     $breakStart = $arrival->copy()->setTime(13, 30, 0);
                     $breakEnd = $arrival->copy()->setTime(14, 30, 0);
-
-                    // 3. Calculer la durée de la superposition entre la période de travail et la pause
-                    $overlapStart = $arrival->max($breakStart); // Le début de la superposition est le plus tardif des deux départs
-                    $overlapEnd = $departure->min($breakEnd);   // La fin de la superposition est le plus précoce des deux fins
-
+                    $overlapStart = $arrival->max($breakStart);
+                    $overlapEnd = $departure->min($breakEnd);
                     $overlapSeconds = 0;
-                    // Il y a une superposition uniquement si son début est avant sa fin
                     if ($overlapStart->lt($overlapEnd)) {
                         $overlapSeconds = $overlapEnd->diffInSeconds($overlapStart);
                     }
-
-                    // 4. Le temps travaillé est le temps total moins la durée de la pause qui a eu lieu pendant le travail
-                    $workedSeconds = $totalSecondsOnSite - $overlapSeconds;
-                    $workedSeconds = max(0, $workedSeconds); // S'assurer de ne pas avoir de temps négatif
-
+                    $workedSeconds = max(0, $totalSecondsOnSite - $overlapSeconds);
                     $hours = floor($workedSeconds / 3600);
                     $minutes = floor(($workedSeconds % 3600) / 60);
                     $workedDurationFormatted = sprintf('%dh %02dm', $hours, $minutes);
-                    // --- FIN DE LA NOUVELLE LOGIQUE ---
 
-                    if ($workedSeconds < $requiredWorkSeconds) {
-                        $observation = 'Heures incomplètes';
-                    }
-
+                    if ($workedSeconds < $requiredWorkSeconds) $observation = 'Heures incomplètes';
                 } elseif ($arrival && !$departure) {
                     $observation = 'Départ manquant';
                 } elseif (!$arrival && $departure) {
                     $observation = 'Arrivée manquante';
                 } else {
-                    continue; // Ne pas afficher si pas de pointage valide
+                    continue;
                 }
 
                 $dailyRecords[] = [
@@ -120,7 +330,6 @@ class AppController extends Controller
                 ];
             }
 
-            // Trier les employés par ordre alphabétique pour cette journée
             usort($dailyRecords, fn($a, $b) => strcmp($a['name'], $b['name']));
 
             if (!empty($dailyRecords)) {
@@ -130,15 +339,9 @@ class AppController extends Controller
                 ];
             }
         }
-
-        return view('admin.history.index', compact('history'));
+        return $history;
     }
 
-
-    /**
-     * NOUVELLE LOGIQUE INTELLIGENTE :
-     * Gère le pointage en vérifiant l'état de la journée et l'écart de 4 heures.
-     */
     public function storeAttendance(Request $request)
     {
         $validated = $request->validate(['qrcode_id' => 'required|string']);
@@ -150,7 +353,6 @@ class AppController extends Controller
                 return response()->json(['message' => 'Employé non trouvé. QR code invalide.'], 404);
             }
 
-            // On récupère les pointages de l'employé pour AUJOURD'HUI
             $todayAttendances = $employee->attendances()
                 ->whereDate('timestamp', Carbon::today())
                 ->get();
@@ -160,29 +362,23 @@ class AppController extends Controller
 
             $type = null;
 
-            // Scénario 1 : Aucune arrivée n'a été enregistrée aujourd'hui
             if (!$arrivalRecord) {
                 $type = 'Arrivée';
-            }
-            // Scénario 2 : Une arrivée a été enregistrée, mais pas encore de départ
-            elseif ($arrivalRecord && !$departureRecord) {
+            } elseif ($arrivalRecord && !$departureRecord) {
                 $arrivalTime = Carbon::parse($arrivalRecord->timestamp);
                 $now = Carbon::now();
 
-                // On vérifie si au moins 4 heures se sont écoulées
-                if ($arrivalTime->diffInHours($now) < 4) {
+                // On vérifie si au moins 1h30 (90 minutes) se sont écoulées
+                if ($arrivalTime->diffInMinutes($now) < 90) {
                     return response()->json([
-                        'message' => 'Vous devez travailler au moins 4 heures avant de pointer votre départ.'
-                    ], 403); // 403 Forbidden : Action non autorisée
+                        'message' => 'Vous devez travailler au moins 1h30 avant de pointer votre départ.'
+                    ], 403);
                 }
                 $type = 'Sortie';
-            }
-            // Scénario 3 : Une arrivée ET un départ ont déjà été enregistrés pour la journée
-            else {
-                return response()->json(['message' => 'Vous avez déjà enregistré une arrivée et une sortie aujourd\'hui.'], 409); // 409 Conflict
+            } else {
+                return response()->json(['message' => 'Vous avez déjà enregistré une arrivée et une sortie aujourd\'hui.'], 409);
             }
 
-            // Enregistrement du pointage
             $attendance = $employee->attendances()->create([
                 'timestamp' => now(),
                 'type' => $type,

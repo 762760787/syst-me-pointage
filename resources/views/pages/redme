@@ -88,9 +88,7 @@ document.addEventListener('DOMContentLoaded', () => {
         statusElement.textContent = "Démarrage de la caméra...";
         // Démarrage du scanner avec la nouvelle configuration
         appState.scanner.start(
-            // --- MODIFICATION ---
-            // Remplacer "environment" par "user" pour utiliser la caméra frontale (selfie).
-            { facingMode: "user" }, // Caméra avant par défaut
+            { facingMode: "environment" }, // Caméra arrière par défaut
             qrScannerConfig,
             onScanSuccess, // Fonction appelée en cas de succès
             (errorMessage) => { /* Ne rien faire si aucun QR code n'est trouvé */ }
@@ -167,4 +165,3 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 </script>
 @endpush
-

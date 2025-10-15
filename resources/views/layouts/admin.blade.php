@@ -40,8 +40,9 @@
                     <a href="{{ route('admin.attendances.index') }}" class="{{ request()->routeIs('admin.attendances.*') ? 'bg-gray-900 text-white' : 'text-gray-300 hover:bg-gray-700 hover:text-white' }} group flex items-center px-2 py-2 text-sm font-medium rounded-md">
                         Feuilles de Présence
                     </a>
-                    <a href="{{ route('admin.historique') }}" class="{{ request()->routeIs('admin.historique.*') ? 'bg-gray-900 text-white' : 'text-gray-300 hover:bg-gray-700 hover:text-white' }} group flex items-center px-2 py-2 text-sm font-medium rounded-md">
-                        historique Pointage
+                    {{-- NOUVEAU MENU AJOUTÉ --}}
+                    <a href="{{ route('admin.history.index') }}" class="{{ request()->routeIs('admin.history.*') ? 'bg-gray-900 text-white' : 'text-gray-300 hover:bg-gray-700 hover:text-white' }} group flex items-center px-2 py-2 text-sm font-medium rounded-md">
+                        Historique Pointages
                     </a>
                 </nav>
             </div>
@@ -81,4 +82,3 @@
 </div>
 </body>
 </html>
-
